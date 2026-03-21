@@ -87,14 +87,14 @@ jobs:
             [ -f "$f" ] || continue
             L=$(wc -l < "$f" 2>/dev/null || echo 0)
             ASM=$((ASM + L))
-          done < <(find ./app -name "*.s" -o -name "*.S" 2>/dev/null)
+          done < <(find ./app/src -name "*.s" -o -name "*.S" 2>/dev/null)
 
           CC=0
           while IFS= read -r f; do
             [ -f "$f" ] || continue
             L=$(wc -l < "$f" 2>/dev/null || echo 0)
             CC=$((CC + L))
-          done < <(find ./app -name "*.c" -o -name "*.cpp" 2>/dev/null)
+          done < <(find ./app/src -name "*.c" -o -name "*.cpp" 2>/dev/null)
 
           BLD=0
           while IFS= read -r f; do
