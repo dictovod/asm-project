@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(AssemblyNativeActivity ASM)
+project(AssemblyNativeActivity C ASM)
 enable_language(ASM)
 
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a+simd")
+    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -O2 -march=armv8-a+simd")
 endif()
 
 find_library(log-lib log)
@@ -13,6 +14,10 @@ add_library(
     AssemblyNativeActivity
     SHARED
     src/main/cpp/asm/main_asm.S
+)
+
+set_target_properties(AssemblyNativeActivity PROPERTIES
+    LINKER_LANGUAGE C
 )
 
 target_link_libraries(
