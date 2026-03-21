@@ -1,45 +1,34 @@
-// main_asm.S — 100% ARM64 Assembly для Android NativeActivity
-// Hello World на экране через ANativeWindow + программный рендер
-// Нет C, нет C++ — только ASM
+// main_asm.S — 100% ARM64 Assembly, Android NativeActivity
+// Hello World через ANativeWindow, рендер в отдельном потоке
 
 .section .text
 .global ANativeActivity_onCreate
-.global android_main
 
 // ─── КОНСТАНТЫ ───────────────────────────────────────────────
-.equ ANDROID_LOG_INFO,          4
-.equ ANDROID_LOG_DEBUG,         3
-.equ ANDROID_LOG_ERROR,         6
-
-// ANativeActivity offsets
-.equ ACTIVITY_CALLBACKS,        0
-.equ ACTIVITY_VM,               8
-.equ ACTIVITY_ENV,             16
-.equ ACTIVITY_CLAZZ,           24
+.equ ANDROID_LOG_INFO,           4
+.equ ANDROID_LOG_ERROR,          6
+.equ WINDOW_FORMAT_RGBA_8888,    1
 
 // ANativeActivityCallbacks offsets
-.equ CB_ONDESTROY,             40
-.equ CB_ONNATIVEWINDOWCREATED, 56
+.equ CB_ONDESTROY,               40
+.equ CB_ONNATIVEWINDOWCREATED,   56
 .equ CB_ONNATIVEWINDOWDESTROYED, 72
 
-// Формат пикселей
-.equ WINDOW_FORMAT_RGBA_8888,   1
-
-// Цвета
-.equ COLOR_BG_LO,   0x1A2E      // нижние 16 бит 0xFF1A2E1A... нет
-// Используем mov/movk для полных 32-битных цветов
+// pthread_attr: default = 0 (NULL)
+// nanosleep syscall = 101
 
 // ─── ДАННЫЕ ──────────────────────────────────────────────────
 .section .rodata
+tag_str:       .asciz "ASM_HELLO"
+msg_create:    .asciz "onCreate — pure ARM64 ASM"
+msg_thread:    .asciz "Render thread started"
+msg_window:    .asciz "Window acquired"
+msg_render:    .asciz "Rendering Hello World"
+msg_stop:      .asciz "Render thread stopped"
+msg_nolock:    .asciz "ANativeWindow_lock failed"
 
-tag_str:      .asciz "ASM_HELLO"
-msg_create:   .asciz "ANativeActivity_onCreate — pure ARM64 ASM"
-msg_window:   .asciz "Window created — rendering Hello World"
-msg_destroy:  .asciz "Window destroyed"
-msg_nolock:   .asciz "ANativeWindow_lock failed"
-
-// Пиксельный шрифт 5x7: "Hello World"
-// Каждый символ = 7 байт (7 строк по 5 бит)
+// Пиксельный шрифт 5x7
+// "Hello World!" — 12 символов, каждый 7 байт
 font_data:
     // H
     .byte 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001, 0b10001
@@ -65,27 +54,28 @@ font_data:
     .byte 0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10011, 0b01101
     // !
     .byte 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100
-.equ FONT_CHAR_COUNT, 12
+.equ FONT_CHARS, 12
 
-// ─── СОСТОЯНИЕ ───────────────────────────────────────────────
+// ─── ГЛОБАЛЬНОЕ СОСТОЯНИЕ ────────────────────────────────────
 .section .bss
 .align 8
-g_window:    .space 8
-g_running:   .space 4
+g_window:     .space 8    // ANativeWindow* (атомарно)
+g_running:    .space 4    // 1 = работать, 0 = стоп
 .align 4
+g_thread:     .space 8    // pthread_t
 
 .section .text
 
 // ═══════════════════════════════════════════════════════════════
 // ANativeActivity_onCreate
-// x0=ANativeActivity*, x1=savedState*, x2=savedStateSize
+// x0=ANativeActivity*, x1=savedState*, x2=size
 // ═══════════════════════════════════════════════════════════════
 ANativeActivity_onCreate:
     stp     x29, x30, [sp, #-32]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
 
-    mov     x19, x0
+    mov     x19, x0                     // activity
 
     // g_running = 1
     adrp    x0, g_running
@@ -93,104 +83,119 @@ ANativeActivity_onCreate:
     mov     w1, #1
     str     w1, [x0]
 
-    // Установить коллбеки
-    ldr     x0, [x19, #ACTIVITY_CALLBACKS]
+    // g_window = NULL
+    adrp    x0, g_window
+    add     x0, x0, :lo12:g_window
+    str     xzr, [x0]
 
-    adrp    x1, asm_on_window_created
-    add     x1, x1, :lo12:asm_on_window_created
+    // Установить коллбеки через activity->callbacks
+    ldr     x0, [x19]                   // callbacks*
+
+    adrp    x1, cb_on_window_created
+    add     x1, x1, :lo12:cb_on_window_created
     str     x1, [x0, #CB_ONNATIVEWINDOWCREATED]
 
-    adrp    x1, asm_on_window_destroyed
-    add     x1, x1, :lo12:asm_on_window_destroyed
+    adrp    x1, cb_on_window_destroyed
+    add     x1, x1, :lo12:cb_on_window_destroyed
     str     x1, [x0, #CB_ONNATIVEWINDOWDESTROYED]
 
-    adrp    x1, asm_on_destroy
-    add     x1, x1, :lo12:asm_on_destroy
+    adrp    x1, cb_on_destroy
+    add     x1, x1, :lo12:cb_on_destroy
     str     x1, [x0, #CB_ONDESTROY]
 
-    // Лог
+    // Запустить рендер-поток: pthread_create(&g_thread, NULL, render_thread, NULL)
+    adrp    x0, g_thread
+    add     x0, x0, :lo12:g_thread
+    mov     x1, #0                      // attr = NULL
+    adrp    x2, render_thread
+    add     x2, x2, :lo12:render_thread
+    mov     x3, #0                      // arg = NULL
+    bl      pthread_create
+
     adrp    x0, tag_str
     add     x0, x0, :lo12:tag_str
     adrp    x1, msg_create
     add     x1, x1, :lo12:msg_create
-    bl      asm_log_info
+    bl      asm_log
 
     ldp     x19, x20, [sp, #16]
     ldp     x29, x30, [sp], #32
     ret
 
 // ═══════════════════════════════════════════════════════════════
-// asm_on_window_created
+// cb_on_window_created — коллбек Android (быстрый, не блокирует)
 // x0=ANativeActivity*, x1=ANativeWindow*
 // ═══════════════════════════════════════════════════════════════
-asm_on_window_created:
+cb_on_window_created:
+    adrp    x0, g_window
+    add     x0, x0, :lo12:g_window
+    str     x1, [x0]                    // g_window = window (атомарно для arm64)
+    ret
+
+// ═══════════════════════════════════════════════════════════════
+// cb_on_window_destroyed
+// ═══════════════════════════════════════════════════════════════
+cb_on_window_destroyed:
+    adrp    x0, g_window
+    add     x0, x0, :lo12:g_window
+    str     xzr, [x0]                   // g_window = NULL
+    ret
+
+// ═══════════════════════════════════════════════════════════════
+// cb_on_destroy
+// ═══════════════════════════════════════════════════════════════
+cb_on_destroy:
+    adrp    x0, g_running
+    add     x0, x0, :lo12:g_running
+    str     wzr, [x0]                   // g_running = 0
+    // Дождаться завершения потока
+    adrp    x0, g_thread
+    add     x0, x0, :lo12:g_thread
+    ldr     x0, [x0]
+    mov     x1, #0
+    b       pthread_join                // tail call
+
+// ═══════════════════════════════════════════════════════════════
+// render_thread — рендер в отдельном потоке
+// x0 = arg (не используется)
+// ═══════════════════════════════════════════════════════════════
+render_thread:
     stp     x29, x30, [sp, #-32]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
 
-    mov     x19, x1                     // window
-
-    // g_window = window
-    adrp    x0, g_window
-    add     x0, x0, :lo12:g_window
-    str     x19, [x0]
-
-    // g_running = 1
-    adrp    x0, g_running
-    add     x0, x0, :lo12:g_running
-    mov     w1, #1
-    str     w1, [x0]
-
     adrp    x0, tag_str
     add     x0, x0, :lo12:tag_str
-    adrp    x1, msg_window
-    add     x1, x1, :lo12:msg_window
-    bl      asm_log_info
+    adrp    x1, msg_thread
+    add     x1, x1, :lo12:msg_thread
+    bl      asm_log
 
-    // Запустить рендер цикл
-    mov     x0, x19
-    bl      android_main
+.wait_window:
+    // Ждать пока g_running && g_window != NULL
+    adrp    x0, g_running
+    add     x0, x0, :lo12:g_running
+    ldr     w0, [x0]
+    cbz     w0, .thread_exit
 
-    ldp     x19, x20, [sp, #16]
-    ldp     x29, x30, [sp], #32
-    ret
-
-// ═══════════════════════════════════════════════════════════════
-// asm_on_window_destroyed
-// ═══════════════════════════════════════════════════════════════
-asm_on_window_destroyed:
     adrp    x0, g_window
     add     x0, x0, :lo12:g_window
-    str     xzr, [x0]
-    adrp    x0, g_running
-    add     x0, x0, :lo12:g_running
-    str     wzr, [x0]
-    adrp    x0, tag_str
-    add     x0, x0, :lo12:tag_str
-    adrp    x1, msg_destroy
-    add     x1, x1, :lo12:msg_destroy
-    b       asm_log_info
+    ldr     x19, [x0]
+    cbnz    x19, .got_window
 
-// ═══════════════════════════════════════════════════════════════
-// asm_on_destroy
-// ═══════════════════════════════════════════════════════════════
-asm_on_destroy:
-    adrp    x0, g_running
-    add     x0, x0, :lo12:g_running
-    str     wzr, [x0]
-    ret
+    // Спать 5ms и повторить
+    sub     sp, sp, #16
+    str     xzr, [sp]                   // tv_sec=0
+    mov     x0, #0x4E20                 // 5_000_000 ns = 5ms
+    movk    x0, #0x004C, lsl #16
+    str     x0, [sp, #8]
+    mov     x0, sp
+    mov     x1, #0
+    mov     x8, #101                    // SYS_nanosleep
+    svc     #0
+    add     sp, sp, #16
+    b       .wait_window
 
-// ═══════════════════════════════════════════════════════════════
-// android_main — рендер цикл
-// x0 = ANativeWindow*
-// ═══════════════════════════════════════════════════════════════
-android_main:
-    stp     x29, x30, [sp, #-32]!
-    mov     x29, sp
-    stp     x19, x20, [sp, #16]
-
-    mov     x19, x0                     // window
-
+.got_window:
     // Установить формат RGBA_8888
     mov     x0, x19
     mov     w1, #WINDOW_FORMAT_RGBA_8888
@@ -199,257 +204,270 @@ android_main:
     bl      ANativeWindow_setBuffersGeometry
 
 .render_loop:
-    // Проверить g_running
     adrp    x0, g_running
     add     x0, x0, :lo12:g_running
     ldr     w0, [x0]
-    cbz     w0, .render_exit
+    cbz     w0, .thread_exit
+
+    adrp    x0, g_window
+    add     x0, x0, :lo12:g_window
+    ldr     x0, [x0]
+    cbz     x0, .wait_window            // окно пропало — ждать снова
 
     // Нарисовать кадр
-    mov     x0, x19
     bl      asm_draw_frame
 
-    // nanosleep ~16ms (syscall 101)
-    sub     sp, sp, #32
-    str     xzr, [sp]                   // tv_sec = 0
-    mov     x0, #0xF500
-    movk    x0, #0x00F4, lsl #16        // tv_nsec ≈ 16ms
+    // nanosleep 16ms (≈60fps)
+    sub     sp, sp, #16
+    str     xzr, [sp]                   // tv_sec=0
+    mov     x0, #0x8000
+    movk    x0, #0x00F4, lsl #16        // ≈16ms
     str     x0, [sp, #8]
     mov     x0, sp
     mov     x1, #0
     mov     x8, #101
     svc     #0
-    add     sp, sp, #32
+    add     sp, sp, #16
 
     b       .render_loop
 
-.render_exit:
+.thread_exit:
+    adrp    x0, tag_str
+    add     x0, x0, :lo12:tag_str
+    adrp    x1, msg_stop
+    add     x1, x1, :lo12:msg_stop
+    bl      asm_log
+
+    mov     x0, #0
     ldp     x19, x20, [sp, #16]
     ldp     x29, x30, [sp], #32
     ret
 
 // ═══════════════════════════════════════════════════════════════
 // asm_draw_frame — нарисовать Hello World
-// x0 = ANativeWindow*
+// (берёт окно из g_window)
 // ═══════════════════════════════════════════════════════════════
 asm_draw_frame:
-    stp     x29, x30, [sp, #-96]!
+    stp     x29, x30, [sp, #-80]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
     stp     x21, x22, [sp, #32]
     stp     x23, x24, [sp, #48]
     stp     x25, x26, [sp, #64]
 
-    mov     x19, x0                     // window
+    // Загрузить текущее окно
+    adrp    x19, g_window
+    add     x19, x19, :lo12:g_window
+    ldr     x19, [x19]
+    cbz     x19, .df_exit
 
-    // ANativeWindow_Buffer: width(4) height(4) stride(4) format(4) bits(8) reserved(6*8)
+    // ANativeWindow_Buffer на стеке (56 байт достаточно)
     sub     sp, sp, #64
+    mov     x0, x19
     mov     x1, sp
     mov     x2, #0
-    mov     x0, x19
     bl      ANativeWindow_lock
-    cbnz    w0, .frame_fail
+    cbnz    w0, .df_unlock_fail
 
     ldr     w20, [sp]                   // width
     ldr     w21, [sp, #4]               // height
     ldr     w22, [sp, #8]               // stride
-    ldr     x23, [sp, #32]              // bits
+    ldr     x23, [sp, #32]              // bits*
 
-    // Залить фон: тёмно-синий 0xFF1A1A2E
+    // Залить фон 0xFF1A1A2E
     mov     w0, w21
-    mul     w0, w0, w22                 // total = height * stride
+    mul     w0, w0, w22
     mov     x24, x23
     mov     w1, w0
     mov     w2, #0x1A2E
     movk    w2, #0xFF1A, lsl #16
     bl      asm_fill_color
 
-    // Масштаб текста: scale = width / 160  (минимум 2)
+    // Масштаб: scale = max(2, width/120)
+    mov     w25, w20
+    mov     w26, #120
+    udiv    w25, w25, w26
+    cmp     w25, #2
+    bge     .scale_ok
     mov     w25, #2
-    lsr     w0, w20, #7                 // width / 128
-    cmp     w0, #2
-    csel    w25, w25, w0, lt            // scale = max(2, width/128)
+.scale_ok:
+    cmp     w25, #8                     // ограничим масштаб
+    ble     .scale_ok2
+    mov     w25, #8
+.scale_ok2:
 
-    // Ширина строки = FONT_CHAR_COUNT * (5+1) * scale
-    mov     w0, #FONT_CHAR_COUNT
+    // text_width = FONT_CHARS * 6 * scale
+    mov     w0, #FONT_CHARS
     mov     w1, #6
     mul     w0, w0, w1
-    mul     w0, w0, w25                 // text_width
+    mul     w0, w0, w25
 
     // x_start = (width - text_width) / 2
     sub     w24, w20, w0
-    asr     w24, w24, #1                // x_start
+    asr     w24, w24, #1
+    // Защита от отрицательного x
+    cmp     w24, #0
+    bge     .xstart_ok
+    mov     w24, #2
+.xstart_ok:
 
     // y_start = height/2 - (7*scale/2)
     mov     w0, #7
     mul     w0, w0, w25
     asr     w0, w0, #1
     asr     w26, w21, #1
-    sub     w26, w26, w0                // y_start
+    sub     w26, w26, w0
+    cmp     w26, #0
+    bge     .ystart_ok
+    mov     w26, #2
+.ystart_ok:
 
     // Нарисовать каждый символ
-    mov     w0, #0                      // char index
+    mov     w19, #0                     // char_index (переиспользуем x19 как int)
 
-.draw_chars:
-    cmp     w0, #FONT_CHAR_COUNT
-    bge     .draw_done_chars
-
-    str     w0, [sp, #56]              // сохранить char index
+.char_loop:
+    cmp     w19, #FONT_CHARS
+    bge     .chars_done
 
     // font_ptr = font_data + char_index * 7
-    adrp    x1, font_data
-    add     x1, x1, :lo12:font_data
-    ldr     w0, [sp, #56]
-    mov     w2, #7
-    mul     w2, w0, w2
-    add     x1, x1, x2                 // char font ptr
+    adrp    x0, font_data
+    add     x0, x0, :lo12:font_data
+    mov     w1, #7
+    mul     w1, w19, w1
+    add     x0, x0, x1                  // x0 = char font data
 
-    // x = x_start + char_index * 6 * scale
-    ldr     w0, [sp, #56]
-    mov     w2, #6
-    mul     w2, w0, w2
-    mul     w2, w2, w25
-    add     w2, w24, w2                 // char_x
+    // char_x = x_start + char_index * 6 * scale
+    mov     w1, #6
+    mul     w1, w19, w1
+    mul     w1, w1, w25
+    add     w1, w24, w1                 // char_x
 
-    // Нарисовать символ (7 строк, 5 колонок) * scale
-    mov     w3, #0                      // row
+    // Нарисовать символ: 7 строк x 5 колонок x scale x scale
+    mov     w2, #0                      // row
 
-.draw_row:
-    cmp     w3, #7
-    bge     .draw_row_done
+.row_loop:
+    cmp     w2, #7
+    bge     .row_done
+    ldrb    w3, [x0, x2]              // bitmap_row
 
-    ldrb    w4, [x1, x3]              // bitmap row
-
-    mov     w5, #0                      // col
-
-.draw_col:
-    cmp     w5, #5
-    bge     .draw_col_done
+    mov     w4, #0                      // col
+.col_loop:
+    cmp     w4, #5
+    bge     .col_done
 
     // Проверить бит
-    mov     w6, #4
-    sub     w6, w6, w5
-    lsr     w6, w4, w6
-    and     w6, w6, #1
-    cbz     w6, .draw_col_next
+    mov     w5, #4
+    sub     w5, w5, w4
+    lsr     w5, w3, w5
+    and     w5, w5, #1
+    cbz     w5, .col_next
 
-    // Нарисовать scale x scale пиксельный блок
-    mov     w7, #0                      // sy
-
-.draw_sy:
-    cmp     w7, w25
-    bge     .draw_sy_done
-    mov     w8, #0                      // sx
-
-.draw_sx:
-    cmp     w8, w25
-    bge     .draw_sx_done
+    // Нарисовать scale×scale блок
+    mov     w5, #0                      // sy
+.sy_loop:
+    cmp     w5, w25
+    bge     .sy_done
+    mov     w6, #0                      // sx
+.sx_loop:
+    cmp     w6, w25
+    bge     .sx_done
 
     // py = y_start + row*scale + sy
-    mul     w9, w3, w25
-    add     w9, w26, w9
-    add     w9, w9, w7
+    mul     w7, w2, w25
+    add     w7, w26, w7
+    add     w7, w7, w5
+    cmp     w7, w21
+    bge     .sx_next
 
     // px = char_x + col*scale + sx
-    mul     w10, w5, w25
-    add     w10, w2, w10
-    add     w10, w10, w8
+    mul     w8, w4, w25
+    add     w8, w1, w8
+    add     w8, w8, w6
+    cmp     w8, w20
+    bge     .sx_next
 
-    // Проверить границы
-    cmp     w9, w21
-    bge     .draw_sx_next
-    cmp     w10, w20
-    bge     .draw_sx_next
+    // offset = (py*stride + px) * 4
+    mul     w9, w7, w22
+    add     w9, w9, w8
+    lsl     x9, x9, #2
+    add     x9, x23, x9
 
-    // offset = py*stride + px
-    mul     w11, w9, w22
-    add     w11, w11, w10
-    lsl     x11, x11, #2
-    add     x11, x23, x11
+    // Цвет текста 0xFFE8E8FF
+    mov     w10, #0xE8FF
+    movk    w10, #0xFFE8, lsl #16
+    str     w10, [x9]
 
-    // Цвет текста: 0xFFE8E8FF
-    mov     w12, #0xE8FF
-    movk    w12, #0xFFE8, lsl #16
-    str     w12, [x11]
-
-.draw_sx_next:
-    add     w8, w8, #1
-    b       .draw_sx
-
-.draw_sx_done:
-    add     w7, w7, #1
-    b       .draw_sy
-
-.draw_sy_done:
-.draw_col_next:
+.sx_next:
+    add     w6, w6, #1
+    b       .sx_loop
+.sx_done:
     add     w5, w5, #1
-    b       .draw_col
+    b       .sy_loop
+.sy_done:
+.col_next:
+    add     w4, w4, #1
+    b       .col_loop
+.col_done:
+    add     w2, w2, #1
+    b       .row_loop
+.row_done:
+    add     w19, w19, #1
+    b       .char_loop
 
-.draw_col_done:
-    add     w3, w3, #1
-    b       .draw_row
-
-.draw_row_done:
-    ldr     w0, [sp, #56]
-    add     w0, w0, #1
-    b       .draw_chars
-
-.draw_done_chars:
+.chars_done:
     add     sp, sp, #64
 
     // ANativeWindow_unlockAndPost
-    mov     x0, x19
+    adrp    x0, g_window
+    add     x0, x0, :lo12:g_window
+    ldr     x0, [x0]
+    cbz     x0, .df_exit
     bl      ANativeWindow_unlockAndPost
+    b       .df_exit
 
-    b       .frame_done
-
-.frame_fail:
+.df_unlock_fail:
     add     sp, sp, #64
-    adrp    x0, tag_str
-    add     x0, x0, :lo12:tag_str
-    adrp    x1, msg_nolock
-    add     x1, x1, :lo12:msg_nolock
-    bl      asm_log_info
 
-.frame_done:
+.df_exit:
     ldp     x25, x26, [sp, #64]
     ldp     x23, x24, [sp, #48]
     ldp     x21, x22, [sp, #32]
     ldp     x19, x20, [sp, #16]
-    ldp     x29, x30, [sp], #96
+    ldp     x29, x30, [sp], #80
     ret
 
 // ═══════════════════════════════════════════════════════════════
-// asm_fill_color — NEON заливка буфера
-// x0=buf, w1=count(pixels), w2=color
+// asm_fill_color — NEON заливка
+// x0=buf, w1=pixels, w2=color
 // ═══════════════════════════════════════════════════════════════
 asm_fill_color:
-    cbz     w1, .fill_done
+    cbz     w1, .fc_done
+    cbz     x0, .fc_done
     dup     v0.4s, w2
     dup     v1.4s, w2
     dup     v2.4s, w2
     dup     v3.4s, w2
     lsr     w3, w1, #4
-    cbz     w3, .fill_tail
-.fill_loop:
+    cbz     w3, .fc_tail
+.fc_loop:
     st1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x0], #64
     subs    w3, w3, #1
-    bne     .fill_loop
-.fill_tail:
+    bne     .fc_loop
+.fc_tail:
     and     w1, w1, #15
-    cbz     w1, .fill_done
-.fill_px:
+    cbz     w1, .fc_done
+.fc_px:
     str     w2, [x0], #4
     subs    w1, w1, #1
-    bne     .fill_px
-.fill_done:
+    bne     .fc_px
+.fc_done:
     ret
 
 // ═══════════════════════════════════════════════════════════════
-// asm_log_info
+// asm_log — логирование
 // x0=tag, x1=msg
 // ═══════════════════════════════════════════════════════════════
-asm_log_info:
+asm_log:
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp
     mov     x2, x1
