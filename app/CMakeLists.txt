@@ -21,8 +21,7 @@ set_target_properties(AssemblyNativeActivity PROPERTIES
 
 target_link_libraries(
     AssemblyNativeActivity
-    -nostdlib
-    -Wl,--no-undefined
     ${log-lib}
     ${android-lib}
+    -lc
 )
