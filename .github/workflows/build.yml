@@ -1,0 +1,137 @@
+name: Build ASM Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and CMake
+        run: |
+          sdkmanager "ndk;29.0.13113456" "cmake;4.0.2"
+
+      - name: Set local.properties
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --no-daemon --console=plain
+
+      - name: Full Analysis Report
+        run: |
+          set -e
+          APK=$(find . -name "*.apk" -not -path "*/incrementalMergedAssets/*" | head -1)
+          echo "APK: $APK"
+          APK_BYTES=$(stat -c%s "$APK")
+          APK_MB=$(echo "scale=3; $APK_BYTES / 1048576" | bc)
+
+          SO_NAME=$(unzip -l "$APK" | grep "lib/arm64-v8a" | grep "\.so" | awk '{print $4}' | head -1)
+          echo "SO: $SO_NAME"
+          unzip -p "$APK" "$SO_NAME" > /tmp/lib.so
+          SO_BYTES=$(stat -c%s /tmp/lib.so)
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║           FULL BUILD REPORT — ASM ANDROID APK           ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          printf "║  APK файл   : %-44s║\n" "$(basename $APK)"
+          printf "║  APK размер : %-44s║\n" "${APK_MB} MB  (${APK_BYTES} bytes)"
+          printf "║  .so размер : %-44s║\n" "${SO_BYTES} bytes"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║             СЕКЦИИ БИНАРНИКА (.so)                       ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+
+          readelf -S /tmp/lib.so 2>/dev/null | grep -E "^\s+\[" | while read line; do
+            NAME=$(echo "$line" | awk '{print $2}')
+            SIZE_HEX=$(echo "$line" | awk '{print $6}')
+            [ -z "$SIZE_HEX" ] && continue
+            SIZE_DEC=$(printf '%d' "0x${SIZE_HEX}" 2>/dev/null) || continue
+            [ "$SIZE_DEC" -eq 0 ] && continue
+            PCT=$(echo "scale=1; $SIZE_DEC * 100 / $SO_BYTES" | bc)
+            printf "║  %-18s : %8d bytes  (%5s%%)              ║\n" "$NAME" $SIZE_DEC "$PCT"
+          done
+
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║             КЛЮЧЕВЫЕ СЕКЦИИ                              ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "--- readelf raw ---"
+          readelf -S /tmp/lib.so 2>/dev/null
+          echo "--- size ---"
+          size /tmp/lib.so 2>/dev/null || true
+
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║             ИСХОДНЫЙ КОД (строки)                        ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+
+          ASM=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            L=$(wc -l < "$f" 2>/dev/null || echo 0)
+            ASM=$((ASM + L))
+          done < <(find ./app -name "*.s" -o -name "*.S" 2>/dev/null)
+
+          CC=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            L=$(wc -l < "$f" 2>/dev/null || echo 0)
+            CC=$((CC + L))
+          done < <(find ./app -name "*.c" -o -name "*.cpp" 2>/dev/null)
+
+          BLD=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            L=$(wc -l < "$f" 2>/dev/null || echo 0)
+            BLD=$((BLD + L))
+          done < <(find ./app \( -name "CMakeLists.txt" -o -name "*.gradle" -o -name "*.kts" -o -name "*.toml" \) 2>/dev/null)
+
+          TOTAL=$((ASM + CC + BLD))
+          [ $TOTAL -eq 0 ] && TOTAL=1
+
+          ASM_PCT=$(echo "scale=1; $ASM*100/$TOTAL" | bc)
+          CC_PCT=$(echo "scale=1; $CC*100/$TOTAL" | bc)
+          BLD_PCT=$(echo "scale=1; $BLD*100/$TOTAL" | bc)
+
+          printf "║  Assembly (.s/.S)    : %5d строк  (%s%%)              ║\n" $ASM "$ASM_PCT"
+          printf "║  C/C++ (.c/.cpp)    : %5d строк  (%s%%)              ║\n" $CC  "$CC_PCT"
+          printf "║  Build (CMake/Gradle): %5d строк  (%s%%)              ║\n" $BLD "$BLD_PCT"
+          printf "║  ИТОГО              : %5d строк                       ║\n" $TOTAL
+
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║             СИМВОЛЫ                                      ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          readelf -s /tmp/lib.so 2>/dev/null | grep "FUNC" | awk '{print $8}' | while read SYM; do
+            [ -z "$SYM" ] && continue
+            printf "║  %-56s║\n" "$SYM"
+          done
+
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║             ДИЗАССЕМБЛЕР (первые инструкции)             ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          objdump -d /tmp/lib.so 2>/dev/null | head -50 || true
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-asm
+          path: "**/*.apk"
+          retention-days: 30
