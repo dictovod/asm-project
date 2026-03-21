@@ -4,7 +4,6 @@ enable_language(ASM)
 
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a+simd")
-    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -O2 -march=armv8-a+simd")
 endif()
 
 find_library(log-lib log)
@@ -22,6 +21,8 @@ set_target_properties(AssemblyNativeActivity PROPERTIES
 
 target_link_libraries(
     AssemblyNativeActivity
+    -nostdlib
+    -Wl,--no-undefined
     ${log-lib}
     ${android-lib}
 )
