@@ -1,346 +1,460 @@
 // main_asm.S — 100% ARM64 Assembly для Android NativeActivity
-// Содержит: точку входа ANativeActivity_onCreate (замена native_glue.c),
-//           android_main, lifecycle, draw loop, logging, NEON-утилиты
+// Hello World на экране через ANativeWindow + программный рендер
+// Нет C, нет C++ — только ASM
 
 .section .text
 .global ANativeActivity_onCreate
 .global android_main
-.global asm_get_system_time
-.global asm_fill_color
-.global asm_calculate_fps
-.global asm_memset_fast
-.global asm_strlen
-.global asm_event_loop
 
 // ─── КОНСТАНТЫ ───────────────────────────────────────────────
-.equ ANDROID_LOG_INFO,      4
-.equ ANDROID_LOG_DEBUG,     3
-.equ ANDROID_LOG_ERROR,     6
+.equ ANDROID_LOG_INFO,          4
+.equ ANDROID_LOG_DEBUG,         3
+.equ ANDROID_LOG_ERROR,         6
 
-// ─── СТРОКИ (rodata) ─────────────────────────────────────────
+// ANativeActivity offsets
+.equ ACTIVITY_CALLBACKS,        0
+.equ ACTIVITY_VM,               8
+.equ ACTIVITY_ENV,             16
+.equ ACTIVITY_CLAZZ,           24
+
+// ANativeActivityCallbacks offsets
+.equ CB_ONDESTROY,             40
+.equ CB_ONNATIVEWINDOWCREATED, 56
+.equ CB_ONNATIVEWINDOWDESTROYED, 72
+
+// Формат пикселей
+.equ WINDOW_FORMAT_RGBA_8888,   1
+
+// Цвета
+.equ COLOR_BG_LO,   0x1A2E      // нижние 16 бит 0xFF1A2E1A... нет
+// Используем mov/movk для полных 32-битных цветов
+
+// ─── ДАННЫЕ ──────────────────────────────────────────────────
 .section .rodata
-tag_str:        .asciz "ASM_NATIVE"
-msg_start:      .asciz "=== Android Assembly App Started ==="
-msg_loop:       .asciz "Main loop tick: %d"
-msg_init:       .asciz "NativeActivity initialized from pure ASM"
-msg_destroy:    .asciz "NativeActivity destroyed"
-msg_resume:     .asciz "Activity RESUMED"
-msg_pause:      .asciz "Activity PAUSED"
-msg_fps:        .asciz "FPS: %d | Frame: %d | Time: %lld ms"
-msg_window:     .asciz "Window created, starting render loop"
-msg_color:      .asciz "Frame color R:%d G:%d B:%d"
-msg_oncreate:   .asciz "ANativeActivity_onCreate called from ASM"
+
+tag_str:      .asciz "ASM_HELLO"
+msg_create:   .asciz "ANativeActivity_onCreate — pure ARM64 ASM"
+msg_window:   .asciz "Window created — rendering Hello World"
+msg_destroy:  .asciz "Window destroyed"
+msg_nolock:   .asciz "ANativeWindow_lock failed"
+
+// Пиксельный шрифт 5x7: "Hello World"
+// Каждый символ = 7 байт (7 строк по 5 бит)
+font_data:
+    // H
+    .byte 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001, 0b10001
+    // e
+    .byte 0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110
+    // l
+    .byte 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110
+    // l
+    .byte 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110
+    // o
+    .byte 0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110
+    // (space)
+    .byte 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000
+    // W
+    .byte 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b11011, 0b10001
+    // o
+    .byte 0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110
+    // r
+    .byte 0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000
+    // l
+    .byte 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110
+    // d
+    .byte 0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10011, 0b01101
+    // !
+    .byte 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100
+.equ FONT_CHAR_COUNT, 12
+
+// ─── СОСТОЯНИЕ ───────────────────────────────────────────────
+.section .bss
+.align 8
+g_window:    .space 8
+g_running:   .space 4
+.align 4
 
 .section .text
 
-// ═══════════════════════════════════════════════════════
-// ANativeActivity_onCreate — точка входа Android
-// Заменяет native_glue.c полностью
-// x0 = ANativeActivity*, x1 = savedState*, x2 = savedStateSize
-// ═══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// ANativeActivity_onCreate
+// x0=ANativeActivity*, x1=savedState*, x2=savedStateSize
+// ═══════════════════════════════════════════════════════════════
 ANativeActivity_onCreate:
-    stp     x29, x30, [sp, #-16]!
-    mov     x29, sp
-
-    // Логируем вход
-    adrp    x0, tag_str
-    add     x0, x0, :lo12:tag_str
-    adrp    x1, msg_oncreate
-    add     x1, x1, :lo12:msg_oncreate
-    bl      asm_log_info
-
-    // Передаём управление в android_main
-    // В реальном NativeActivity android_main вызывается через app glue,
-    // здесь вызываем напрямую с нулевым аргументом
-    mov     x0, #0
-    bl      android_main
-
-    ldp     x29, x30, [sp], #16
-    ret
-
-// ═══════════════════════════════════════════════════════
-// android_main — основной цикл приложения
-// x0 = struct android_app* (может быть 0 при прямом вызове)
-// ═══════════════════════════════════════════════════════
-android_main:
-    stp     x29, x30, [sp, #-64]!
+    stp     x29, x30, [sp, #-32]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
-    stp     x21, x22, [sp, #32]
-    stp     x23, x24, [sp, #48]
 
     mov     x19, x0
 
+    // g_running = 1
+    adrp    x0, g_running
+    add     x0, x0, :lo12:g_running
+    mov     w1, #1
+    str     w1, [x0]
+
+    // Установить коллбеки
+    ldr     x0, [x19, #ACTIVITY_CALLBACKS]
+
+    adrp    x1, asm_on_window_created
+    add     x1, x1, :lo12:asm_on_window_created
+    str     x1, [x0, #CB_ONNATIVEWINDOWCREATED]
+
+    adrp    x1, asm_on_window_destroyed
+    add     x1, x1, :lo12:asm_on_window_destroyed
+    str     x1, [x0, #CB_ONNATIVEWINDOWDESTROYED]
+
+    adrp    x1, asm_on_destroy
+    add     x1, x1, :lo12:asm_on_destroy
+    str     x1, [x0, #CB_ONDESTROY]
+
+    // Лог
     adrp    x0, tag_str
     add     x0, x0, :lo12:tag_str
-    adrp    x1, msg_start
-    add     x1, x1, :lo12:msg_start
+    adrp    x1, msg_create
+    add     x1, x1, :lo12:msg_create
     bl      asm_log_info
 
-    mov     x0, x19
-    bl      asm_setup_callbacks
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
 
-    mov     x20, #0
-    mov     x21, #0
-    mov     x22, #0
+// ═══════════════════════════════════════════════════════════════
+// asm_on_window_created
+// x0=ANativeActivity*, x1=ANativeWindow*
+// ═══════════════════════════════════════════════════════════════
+asm_on_window_created:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+
+    mov     x19, x1                     // window
+
+    // g_window = window
+    adrp    x0, g_window
+    add     x0, x0, :lo12:g_window
+    str     x19, [x0]
+
+    // g_running = 1
+    adrp    x0, g_running
+    add     x0, x0, :lo12:g_running
+    mov     w1, #1
+    str     w1, [x0]
 
     adrp    x0, tag_str
     add     x0, x0, :lo12:tag_str
-    adrp    x1, msg_init
-    add     x1, x1, :lo12:msg_init
+    adrp    x1, msg_window
+    add     x1, x1, :lo12:msg_window
     bl      asm_log_info
 
-    b       .main_loop
-
-.main_loop:
+    // Запустить рендер цикл
     mov     x0, x19
-    bl      asm_process_events
+    bl      android_main
 
-    cbz     x19, .skip_destroy_check
-    ldr     w1, [x19, #8]
-    cbnz    w1, .main_exit
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
 
-.skip_destroy_check:
-    add     x20, x20, #1
-
-    and     x1, x20, #63
-    cbnz    x1, .skip_log
-
-    adrp    x0, tag_str
-    add     x0, x0, :lo12:tag_str
-    adrp    x1, msg_loop
-    add     x1, x1, :lo12:msg_loop
-    mov     x2, x20
-    bl      asm_log_debug
-
-.skip_log:
-    cbz     x19, .main_loop
-    ldr     x1, [x19, #16]
-    cbz     x1, .main_loop
-
-    mov     x0, x19
-    mov     x1, x20
-    bl      asm_render_frame
-
-    b       .main_loop
-
-.main_exit:
+// ═══════════════════════════════════════════════════════════════
+// asm_on_window_destroyed
+// ═══════════════════════════════════════════════════════════════
+asm_on_window_destroyed:
+    adrp    x0, g_window
+    add     x0, x0, :lo12:g_window
+    str     xzr, [x0]
+    adrp    x0, g_running
+    add     x0, x0, :lo12:g_running
+    str     wzr, [x0]
     adrp    x0, tag_str
     add     x0, x0, :lo12:tag_str
     adrp    x1, msg_destroy
     add     x1, x1, :lo12:msg_destroy
-    bl      asm_log_info
+    b       asm_log_info
 
-    ldp     x23, x24, [sp, #48]
-    ldp     x21, x22, [sp, #32]
-    ldp     x19, x20, [sp, #16]
-    ldp     x29, x30, [sp], #64
+// ═══════════════════════════════════════════════════════════════
+// asm_on_destroy
+// ═══════════════════════════════════════════════════════════════
+asm_on_destroy:
+    adrp    x0, g_running
+    add     x0, x0, :lo12:g_running
+    str     wzr, [x0]
     ret
 
-// ═══════════════════════════════════════════════════════
-// asm_setup_callbacks
-// ═══════════════════════════════════════════════════════
-asm_setup_callbacks:
-    stp     x29, x30, [sp, #-16]!
-    mov     x29, sp
-    ldp     x29, x30, [sp], #16
-    ret
-
-// ═══════════════════════════════════════════════════════
-// asm_process_events
-// ═══════════════════════════════════════════════════════
-asm_process_events:
+// ═══════════════════════════════════════════════════════════════
+// android_main — рендер цикл
+// x0 = ANativeWindow*
+// ═══════════════════════════════════════════════════════════════
+android_main:
     stp     x29, x30, [sp, #-32]!
     mov     x29, sp
-    str     x19, [sp, #16]
-    mov     x19, x0
-    mov     x0, #0
+    stp     x19, x20, [sp, #16]
+
+    mov     x19, x0                     // window
+
+    // Установить формат RGBA_8888
+    mov     x0, x19
+    mov     w1, #WINDOW_FORMAT_RGBA_8888
+    mov     w2, #0
+    mov     w3, #0
+    bl      ANativeWindow_setBuffersGeometry
+
+.render_loop:
+    // Проверить g_running
+    adrp    x0, g_running
+    add     x0, x0, :lo12:g_running
+    ldr     w0, [x0]
+    cbz     w0, .render_exit
+
+    // Нарисовать кадр
+    mov     x0, x19
+    bl      asm_draw_frame
+
+    // nanosleep ~16ms (syscall 101)
+    sub     sp, sp, #32
+    str     xzr, [sp]                   // tv_sec = 0
+    mov     x0, #0xF500
+    movk    x0, #0x00F4, lsl #16        // tv_nsec ≈ 16ms
+    str     x0, [sp, #8]
+    mov     x0, sp
     mov     x1, #0
-    mov     x2, #0
-    mov     x3, #0
-    bl      ALooper_pollOnce
-    ldr     x19, [sp, #16]
+    mov     x8, #101
+    svc     #0
+    add     sp, sp, #32
+
+    b       .render_loop
+
+.render_exit:
+    ldp     x19, x20, [sp, #16]
     ldp     x29, x30, [sp], #32
     ret
 
-// ═══════════════════════════════════════════════════════
-// asm_render_frame
-// ═══════════════════════════════════════════════════════
-asm_render_frame:
-    stp     x29, x30, [sp, #-48]!
+// ═══════════════════════════════════════════════════════════════
+// asm_draw_frame — нарисовать Hello World
+// x0 = ANativeWindow*
+// ═══════════════════════════════════════════════════════════════
+asm_draw_frame:
+    stp     x29, x30, [sp, #-96]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
-    str     x21, [sp, #32]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
 
-    mov     x19, x0
-    mov     x20, x1
+    mov     x19, x0                     // window
 
-    lsr     w2, w20, #1
-    and     w2, w2, #0xFF
-    lsr     w3, w20, #2
-    and     w3, w3, #0xFF
-    lsr     w4, w20, #3
-    and     w4, w4, #0xFF
+    // ANativeWindow_Buffer: width(4) height(4) stride(4) format(4) bits(8) reserved(6*8)
+    sub     sp, sp, #64
+    mov     x1, sp
+    mov     x2, #0
+    mov     x0, x19
+    bl      ANativeWindow_lock
+    cbnz    w0, .frame_fail
 
+    ldr     w20, [sp]                   // width
+    ldr     w21, [sp, #4]               // height
+    ldr     w22, [sp, #8]               // stride
+    ldr     x23, [sp, #32]              // bits
+
+    // Залить фон: тёмно-синий 0xFF1A1A2E
+    mov     w0, w21
+    mul     w0, w0, w22                 // total = height * stride
+    mov     x24, x23
+    mov     w1, w0
+    mov     w2, #0x1A2E
+    movk    w2, #0xFF1A, lsl #16
+    bl      asm_fill_color
+
+    // Масштаб текста: scale = width / 160  (минимум 2)
+    mov     w25, #2
+    lsr     w0, w20, #7                 // width / 128
+    cmp     w0, #2
+    csel    w25, w25, w0, lt            // scale = max(2, width/128)
+
+    // Ширина строки = FONT_CHAR_COUNT * (5+1) * scale
+    mov     w0, #FONT_CHAR_COUNT
+    mov     w1, #6
+    mul     w0, w0, w1
+    mul     w0, w0, w25                 // text_width
+
+    // x_start = (width - text_width) / 2
+    sub     w24, w20, w0
+    asr     w24, w24, #1                // x_start
+
+    // y_start = height/2 - (7*scale/2)
+    mov     w0, #7
+    mul     w0, w0, w25
+    asr     w0, w0, #1
+    asr     w26, w21, #1
+    sub     w26, w26, w0                // y_start
+
+    // Нарисовать каждый символ
+    mov     w0, #0                      // char index
+
+.draw_chars:
+    cmp     w0, #FONT_CHAR_COUNT
+    bge     .draw_done_chars
+
+    str     w0, [sp, #56]              // сохранить char index
+
+    // font_ptr = font_data + char_index * 7
+    adrp    x1, font_data
+    add     x1, x1, :lo12:font_data
+    ldr     w0, [sp, #56]
+    mov     w2, #7
+    mul     w2, w0, w2
+    add     x1, x1, x2                 // char font ptr
+
+    // x = x_start + char_index * 6 * scale
+    ldr     w0, [sp, #56]
+    mov     w2, #6
+    mul     w2, w0, w2
+    mul     w2, w2, w25
+    add     w2, w24, w2                 // char_x
+
+    // Нарисовать символ (7 строк, 5 колонок) * scale
+    mov     w3, #0                      // row
+
+.draw_row:
+    cmp     w3, #7
+    bge     .draw_row_done
+
+    ldrb    w4, [x1, x3]              // bitmap row
+
+    mov     w5, #0                      // col
+
+.draw_col:
+    cmp     w5, #5
+    bge     .draw_col_done
+
+    // Проверить бит
+    mov     w6, #4
+    sub     w6, w6, w5
+    lsr     w6, w4, w6
+    and     w6, w6, #1
+    cbz     w6, .draw_col_next
+
+    // Нарисовать scale x scale пиксельный блок
+    mov     w7, #0                      // sy
+
+.draw_sy:
+    cmp     w7, w25
+    bge     .draw_sy_done
+    mov     w8, #0                      // sx
+
+.draw_sx:
+    cmp     w8, w25
+    bge     .draw_sx_done
+
+    // py = y_start + row*scale + sy
+    mul     w9, w3, w25
+    add     w9, w26, w9
+    add     w9, w9, w7
+
+    // px = char_x + col*scale + sx
+    mul     w10, w5, w25
+    add     w10, w2, w10
+    add     w10, w10, w8
+
+    // Проверить границы
+    cmp     w9, w21
+    bge     .draw_sx_next
+    cmp     w10, w20
+    bge     .draw_sx_next
+
+    // offset = py*stride + px
+    mul     w11, w9, w22
+    add     w11, w11, w10
+    lsl     x11, x11, #2
+    add     x11, x23, x11
+
+    // Цвет текста: 0xFFE8E8FF
+    mov     w12, #0xE8FF
+    movk    w12, #0xFFE8, lsl #16
+    str     w12, [x11]
+
+.draw_sx_next:
+    add     w8, w8, #1
+    b       .draw_sx
+
+.draw_sx_done:
+    add     w7, w7, #1
+    b       .draw_sy
+
+.draw_sy_done:
+.draw_col_next:
+    add     w5, w5, #1
+    b       .draw_col
+
+.draw_col_done:
+    add     w3, w3, #1
+    b       .draw_row
+
+.draw_row_done:
+    ldr     w0, [sp, #56]
+    add     w0, w0, #1
+    b       .draw_chars
+
+.draw_done_chars:
+    add     sp, sp, #64
+
+    // ANativeWindow_unlockAndPost
+    mov     x0, x19
+    bl      ANativeWindow_unlockAndPost
+
+    b       .frame_done
+
+.frame_fail:
+    add     sp, sp, #64
     adrp    x0, tag_str
     add     x0, x0, :lo12:tag_str
-    adrp    x1, msg_color
-    add     x1, x1, :lo12:msg_color
-    bl      asm_log_debug
+    adrp    x1, msg_nolock
+    add     x1, x1, :lo12:msg_nolock
+    bl      asm_log_info
 
-    ldr     x21, [sp, #32]
+.frame_done:
+    ldp     x25, x26, [sp, #64]
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
     ldp     x19, x20, [sp, #16]
-    ldp     x29, x30, [sp], #48
+    ldp     x29, x30, [sp], #96
     ret
 
-// ═══════════════════════════════════════════════════════
-// asm_fill_color — NEON заполнение буфера
-// x0 = buffer, w1 = size, w2 = color
-// ═══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// asm_fill_color — NEON заливка буфера
+// x0=buf, w1=count(pixels), w2=color
+// ═══════════════════════════════════════════════════════════════
 asm_fill_color:
     cbz     w1, .fill_done
-    cbz     x0, .fill_done
-
     dup     v0.4s, w2
     dup     v1.4s, w2
     dup     v2.4s, w2
     dup     v3.4s, w2
-
-    lsr     w3, w1, #6
-    cbz     w3, .fill_remainder
-
-.fill_loop64:
+    lsr     w3, w1, #4
+    cbz     w3, .fill_tail
+.fill_loop:
     st1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x0], #64
     subs    w3, w3, #1
-    bne     .fill_loop64
-
-.fill_remainder:
-    and     w1, w1, #63
+    bne     .fill_loop
+.fill_tail:
+    and     w1, w1, #15
     cbz     w1, .fill_done
-
-.fill_byte_loop:
+.fill_px:
     str     w2, [x0], #4
-    subs    w1, w1, #4
-    bgt     .fill_byte_loop
-
+    subs    w1, w1, #1
+    bne     .fill_px
 .fill_done:
     ret
 
-// ═══════════════════════════════════════════════════════
-// asm_memset_fast — быстрый memset через NEON
-// x0 = dst, w1 = value, x2 = count
-// ═══════════════════════════════════════════════════════
-asm_memset_fast:
-    cbz     x2, .memset_done
-    dup     v0.16b, w1
-
-    lsr     x3, x2, #4
-    cbz     x3, .memset_tail
-
-.memset_loop:
-    st1     {v0.16b}, [x0], #16
-    subs    x3, x3, #1
-    bne     .memset_loop
-
-.memset_tail:
-    and     x2, x2, #15
-    cbz     x2, .memset_done
-
-.memset_byte:
-    strb    w1, [x0], #1
-    subs    x2, x2, #1
-    bne     .memset_byte
-
-.memset_done:
-    ret
-
-// ═══════════════════════════════════════════════════════
-// asm_strlen
-// x0 = string → x0 = length
-// ═══════════════════════════════════════════════════════
-asm_strlen:
-    mov     x1, x0
-.strlen_loop:
-    ldrb    w2, [x1], #1
-    cbnz    w2, .strlen_loop
-    sub     x0, x1, x0
-    sub     x0, x0, #1
-    ret
-
-// ═══════════════════════════════════════════════════════
-// asm_get_system_time — время в мс
-// ═══════════════════════════════════════════════════════
-asm_get_system_time:
-    stp     x29, x30, [sp, #-32]!
-    mov     x29, sp
-
-    mov     x0, #1
-    add     x1, sp, #16
-    bl      clock_gettime
-
-    ldr     x0, [sp, #16]
-    ldr     x1, [sp, #24]
-
-    mov     x2, #0x3E8
-    mul     x0, x0, x2
-
-    movz    x2, #0x4240
-    movk    x2, #0xF, lsl #16
-    udiv    x1, x1, x2
-
-    add     x0, x0, x1
-
-    ldp     x29, x30, [sp], #32
-    ret
-
-// ═══════════════════════════════════════════════════════
-// asm_calculate_fps
-// x0 = current_ms, x1 = last_ms, x2 = frames → x0 = fps
-// ═══════════════════════════════════════════════════════
-asm_calculate_fps:
-    sub     x3, x0, x1
-    cbz     x3, .fps_zero
-    mov     x4, #0x3E8
-    mul     x2, x2, x4
-    udiv    x0, x2, x3
-    ret
-.fps_zero:
-    mov     x0, #0
-    ret
-
-// ═══════════════════════════════════════════════════════
-// asm_log_info / asm_log_debug
-// x0 = tag, x1 = message
-// ═══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// asm_log_info
+// x0=tag, x1=msg
+// ═══════════════════════════════════════════════════════════════
 asm_log_info:
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp
     mov     x2, x1
-    mov     x1, #ANDROID_LOG_INFO
+    mov     w1, #ANDROID_LOG_INFO
     bl      __android_log_print
-    ldp     x29, x30, [sp], #16
-    ret
-
-asm_log_debug:
-    stp     x29, x30, [sp, #-16]!
-    mov     x29, sp
-    mov     x2, x1
-    mov     x1, #ANDROID_LOG_DEBUG
-    bl      __android_log_print
-    ldp     x29, x30, [sp], #16
-    ret
-
-// ═══════════════════════════════════════════════════════
-// asm_event_loop
-// ═══════════════════════════════════════════════════════
-asm_event_loop:
-    stp     x29, x30, [sp, #-16]!
-    mov     x29, sp
-    mov     x0, #0
-    mov     x1, xzr
-    mov     x2, xzr
-    mov     x3, xzr
-    bl      ALooper_pollOnce
     ldp     x29, x30, [sp], #16
     ret
 
